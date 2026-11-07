@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.part
+.env
+.env.*
+*.key
+*.pem
+secrets*
+*.local.*
+ai_config*
+arranged/
+*.work/
+
+# older local-only pipelines (not published)
+pipeline.py
+pdf_pipeline.py
+epub_pipeline.py
+inline_pipeline.py
+flatten_forms.py
