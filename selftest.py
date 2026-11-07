@@ -1,6 +1,6 @@
 """Synthetic self-test of both pipelines (python selftest.py). Works in the system temp dir, touches no real files."""
 import os, sys, io, shutil
-sys.path.insert(0, r'D:\pdfarranger\photobook_tools')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, pikepdf
 from PIL import Image, ImageFilter
 import photobook_lib as L

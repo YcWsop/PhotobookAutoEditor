@@ -9,7 +9,20 @@ Full resolution is only needed for the QR-code check of mostly white pages and i
 """
 import io, math
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
+
+THREADS = 4     # fixed number of worker threads for the per-page decoding (Pillow's decoder releases the GIL, so threads scale)
+_POOL = None
+
+
+def pool():
+    """the one shared pool of THREADS worker threads (created on first use)"""
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(THREADS, thread_name_prefix='decode')
+    return _POOL
+
 
 FULL = False    # True: decode at full size and also keep the full-resolution edge columns (seam_full)
 AN_H = 272      # analysis height in rows

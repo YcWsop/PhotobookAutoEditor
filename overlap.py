@@ -100,14 +100,34 @@ def small_rgb(path, width):
         im.close()
 
 
+def _evict(cache):
+    if len(cache) > 12:                           # neighbours only: forget the oldest pictures
+        for old in list(cache)[:6]:
+            del cache[old]
+
+
+def warm(cache, infos, width=PRE_WIDTH):
+    """start decoding the prescreen pictures of the pages in `infos` on the shared pool (seam_load.pool()); _get() waits for them.
+    Only pages find() could ever look at (plain portrait pages with a file)."""
+    import seam_load
+    for A in infos:
+        if A.get('opaque') or 'path' not in A or A['h'] <= A['w']:
+            continue
+        k = (A['path'], width)
+        if k not in cache:
+            _evict(cache)
+            cache[k] = seam_load.pool().submit(small_rgb, A['path'], width)
+
+
 def _get(cache, path, width):
     k = (path, width)
     if k not in cache:
-        if len(cache) > 12:                       # neighbours only: forget the oldest pictures
-            for old in list(cache)[:6]:
-                del cache[old]
+        _evict(cache)
         cache[k] = small_rgb(path, width)
-    return cache[k]
+    v = cache[k]
+    if hasattr(v, 'result'):                      # a Future from warm()
+        v = cache[k] = v.result()
+    return v
 
 
 def prescreen(A, B, cache):

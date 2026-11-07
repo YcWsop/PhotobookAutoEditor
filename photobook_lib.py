@@ -296,10 +296,9 @@ def recycle(path):
 
 def make_xobject(pdf, path):
     with Image.open(path) as im:
-        im.load()
         fmt = im.format
         mode = im.mode
-        w, h = im.size
+        w, h = im.size                      # (the header is enough for these; no pixel is decoded for a JPEG that is embedded as is)
         if fmt == 'JPEG' and mode in ('RGB', 'L'):
             data = open(path, 'rb').read()
             st = pikepdf.Stream(pdf, data)
@@ -310,6 +309,7 @@ def make_xobject(pdf, path):
             st.BitsPerComponent = 8
             st.Filter = pikepdf.Name.DCTDecode
             return st
+        im.load()                           # everything below really needs the pixels
         if mode in ('RGBA', 'LA', 'P', 'PA'):
             rgba = im.convert('RGBA')
             bg = Image.new('RGB', rgba.size, (255, 255, 255))
@@ -341,7 +341,7 @@ def fit(sw, sh, bw, bh):
 def build(folder, out_pdf):
     """One PDF from a folder of page images (old pipeline)."""
     paths = list_images(folder)
-    infos = [load_info(p) for p in paths]
+    infos = list(seam_load.pool().map(load_info, paths))      # decoded on seam_load.THREADS threads, in page order
     for i in infos:
         i['name'] = os.path.relpath(i['path'], folder)
         i['key'] = i['path']
@@ -383,24 +383,42 @@ def _decode_small(img, raw):
 def pdf_items(src):
     """Turn each page of an open pikepdf.Pdf into an item. Plain one-picture pages are analysable;
     anything else (text, several images, rotated, undecodable) is 'opaque' and copied through unchanged."""
-    items, ratios = [], []
+    from collections import deque
+    items, ratios, pending = [], [], deque()
+
+    def finish(job):
+        it, pg, img, raw, fut = job
+        try:
+            if fut is not None:
+                w, h, d = fut.result()
+                gf = (lambda o=img: _full_gray(o.read_raw_bytes()))
+            else:
+                w, h, d, gf = _decode_small(img, raw)
+            g = d['g']
+            th = Image.fromarray(g).resize((32, 32), Image.BILINEAR)
+            it.update(opaque=False, w=w, h=h, g=g, rgb8=d['rgb8'], tn=d['tn'], small=np.asarray(th, dtype=np.float32), dh=dhash(g),
+                      sha=hashlib.sha1(raw).hexdigest(), size=len(raw), gfull=gf, **d.get('full', {}),
+                      xo=(lambda dst, o=img: dst.copy_foreign(o)))
+            mb = [float(x) for x in pg.MediaBox]
+            ratios.append((mb[2] - mb[0]) / w)
+        except Exception:
+            it['opaque'] = True
+
     for n, pg in enumerate(src.pages, 1):
         it = dict(page=pg, name='p%d' % n, key='p%d' % n, opaque=True)
+        items.append(it)
         try:
             img = _page_single_image(pg)
             if img is not None:
-                raw = img.read_raw_bytes()
-                w, h, d, gf = _decode_small(img, raw)
-                g = d['g']
-                th = Image.fromarray(g).resize((32, 32), Image.BILINEAR)
-                it.update(opaque=False, w=w, h=h, g=g, rgb8=d['rgb8'], tn=d['tn'], small=np.asarray(th, dtype=np.float32), dh=dhash(g),
-                          sha=hashlib.sha1(raw).hexdigest(), size=len(raw), gfull=gf, **d.get('full', {}),
-                          xo=(lambda dst, o=img: dst.copy_foreign(o)))
-                mb = [float(x) for x in pg.MediaBox]
-                ratios.append((mb[2] - mb[0]) / w)
+                raw = img.read_raw_bytes()          # pikepdf objects are only touched on this thread; the JPEG decoding runs on the pool
+                fut = seam_load.pool().submit(seam_load.load_small, raw) if str(img.get('/Filter')) == '/DCTDecode' else None
+                pending.append((it, pg, img, raw, fut))
+                if len(pending) >= 2 * seam_load.THREADS:     # bounded look-ahead: the raw bytes of a few pages at a time
+                    finish(pending.popleft())
         except Exception:
             it['opaque'] = True
-        items.append(it)
+    while pending:
+        finish(pending.popleft())
     pt = float(np.median(ratios)) if ratios else PT
     return items, pt
 
@@ -477,6 +495,7 @@ def arrange(infos, out_pdf, pt):
             if so:
                 items.append(['spread', so[0], so[1]]); k += 2; continue
             if OVERLAP:
+                overlap.warm(ov_cache, keep[k:k + 5])     # decode this pair and the next pages in parallel (seam_load.THREADS threads)
                 ov = overlap.find(A, keep[k + 1], ov_cache)
                 if ov:                       # two partial pages sharing a band: not a seam case, so take it out of the review queues
                     del UNCERTAIN[nu:], FLAT[nf:]
