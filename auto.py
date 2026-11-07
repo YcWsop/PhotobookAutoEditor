@@ -1,15 +1,16 @@
 """PhotobookAutoEditor entry point: a folder of images, or one or more complete PDFs (not zips) -> one tidied PDF per book.
 
-    python auto.py <folder-or-pdf> [<folder-or-pdf> ...] [--out DIR] [--seam fast|full] [--no-trim]
+    python auto.py <folder-or-pdf> [<folder-or-pdf> ...] [--out DIR] [--seam fast|full] [--no-trim] [--no-overlap] [--gaps FILE] [--force]
 
-Stages (see README):
-  1 prepare   take the images (folder order, or every picture of every PDF page), drop blank / ad / duplicate pages, trim white borders,
-              bring all pages of the main aspect to the largest size of that group (JPEGs are only re-encoded when something changed)
-  2 seam      read the pages and merge one picture split over two pages. --seam fast = reduced-scale pictures (default),
-              --seam full = the original rule on full-resolution pictures (slow; a CUDA version is planned)
-  3 flat      pairs whose seam is a plain colour are NOT merged; the nearly-equal ones are queued
-  4 review    undecided pairs (uncertain + flat) go to ai_hook.review(); returned pairs are merged, the rest stays on the contact sheet
-Output: <out>/<book>.pdf, contact sheets <out>/<book>.uncertain.jpg / .flat.jpg, queue <out>/<book>.queue.json (+ <book>.work/ with the page images).
+阶段（详见 README）:
+  1 prepare   取图（文件夹顺序，或 PDF 每页的每张图），去空白/广告/重复页，去白边，把主要比例的页统一成该组最大尺寸（没改动的 JPEG 原样复制）
+  2 seam      读图并合并被拆成两页的一张图；重叠页（两页共用一条窄带）也在这一步用 overlap.py 找出并拼好。
+              --seam fast = 缩小尺寸的图（默认），--seam full = 完整图 + 原来的 2 像素规则（慢；CUDA 版计划中，未写）
+  3 flat      接缝是纯色的页对不自动合并；颜色几乎相同的进队列
+  4 review    规则判不了的页对（uncertain + flat）交给 ai_hook.review()，返回的页对被合并，其余留在联系表里
+  5 gap       中间缺了一条的两页：做成带透明缝的大图 + 蒙版（gap_repair.py），交给 ai_hook.fill_gap() 或读取已补好的 .filled.png；
+              没人补的任务单留在 <书名>.gaps/，书保持两页
+输出: <out>/<书名>.pdf，联系表 <书名>.uncertain.jpg / .flat.jpg，队列 <书名>.queue.json（+ <书名>.work/ 页面图），补缝任务 <书名>.gaps/
 """
 import argparse, json, os, re, shutil, sys, tempfile
 from collections import Counter
@@ -21,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import photobook_lib as L
 import seam_load
 import ai_hook
+import gap_repair
 
 PAT = re.compile(rb'([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+cm\s+/(\w+)\s+Do')
 WHITE, MAX_TRIM = 240, 0.08
@@ -121,13 +123,46 @@ def prepare(paths, work, trim=True):
     return out, rep
 
 
-def process(unit, out_dir, seam, trim):
+def _read_gaps(path):
+    """--gaps file: JSON list of {"left": "p0007.jpg", "right": "p0008.jpg", "gap": 0.04} or [left, right, gap]"""
+    out = []
+    for g in json.load(open(path, encoding='utf-8')):
+        if isinstance(g, (list, tuple)):
+            g = dict(left=g[0], right=g[1], gap=g[2] if len(g) > 2 else 0.04)
+        out.append(g)
+    return out
+
+
+def _repair_gaps(reqs, pages, gaps_dir):
+    """write a task (transparent-gap picture + mask) for each request; use <task>.filled.png or ai_hook.fill_gap() when there is one.
+    A repaired pair becomes ONE page file '<left stem>_own.jpg' in `pages`. -> (repaired, still waiting)"""
+    done = pending = 0
+    for g in reqs:
+        lp, rp = os.path.join(pages, g['left']), os.path.join(pages, g['right'])
+        if not (os.path.exists(lp) and os.path.exists(rp)):
+            print('   gap: page not found, skipped:', g['left'], g['right'], flush=True)
+            continue
+        job = gap_repair.make_job(lp, rp, float(g.get('gap', 0.04)), gaps_dir)
+        filled = job['filled'] if os.path.exists(job['filled']) else ai_hook.fill_gap(job)
+        if not filled or not os.path.exists(filled):
+            pending += 1
+            continue
+        out = os.path.join(pages, os.path.splitext(g['left'])[0] + L.OWN_TAG + '.jpg')
+        gap_repair.compose(job, filled, out)
+        os.remove(lp); os.remove(rp)
+        done += 1
+    return done, pending
+
+
+def process(unit, out_dir, seam, trim, gap_file=None, force=False):
     name = os.path.basename(unit.rstrip('\\/'))
     name = os.path.splitext(name)[0] if os.path.isfile(unit) else name
     out_pdf = os.path.join(out_dir, name + '.pdf')
-    if os.path.exists(out_pdf):
-        print('SKIP (output exists):', name)
+    if os.path.exists(out_pdf) and not force:
+        print('SKIP (output exists, use --force to redo):', name)
         return
+    if os.path.exists(out_pdf):
+        os.remove(out_pdf)
     work = tempfile.mkdtemp(prefix='auto_')
     try:
         raw = os.path.join(work, 'raw')
@@ -149,25 +184,36 @@ def process(unit, out_dir, seam, trim):
         queue = [dict(kind='uncertain', left=a['name'], right=b['name'], left_img=a['path'], right_img=b['path']) for a, b in pairs_u]
         queue += [dict(kind='flat', left=a['name'], right=b['name'], left_img=a['path'], right_img=b['path'],
                        stats={k: round(float(v), 3) for k, v in st.items()}) for a, b, st in L.FLAT]
-        print('2 seam (%s): %d spread(s), %d page(s) | 3 flat: %d queued | uncertain: %d' % (
-            seam, r['spreads'], r['pages'], len(pairs_f), len(pairs_u)), flush=True)
+        print('2 seam (%s): %d spread(s), %d overlap pair(s), %d page(s) | 3 flat: %d queued | uncertain: %d' % (
+            seam, r['spreads'], r['overlaps'], r['pages'], len(pairs_f), len(pairs_u)), flush=True)
         L.write_review_sheet(os.path.join(out_dir, name + '.uncertain.jpg'), clear=False, pairs=pairs_u)
         L.write_review_sheet(os.path.join(out_dir, name + '.flat.jpg'), clear=False, pairs=pairs_f)
+        keep = os.path.join(out_dir, name + '.work')
+        gap_reqs = _read_gaps(gap_file) if gap_file else []
+        if queue or gap_reqs:                # keep the page images the queue / gap tasks refer to
+            shutil.rmtree(keep, ignore_errors=True)
+            shutil.copytree(pages, keep)
+        rebuild = False
         if queue:
             merges = ai_hook.review(queue) or []
             if merges:
                 L.FORCE.update({frozenset(m): tuple(m) for m in merges})
-                os.remove(out_pdf)
-                L.UNCERTAIN.clear(); L.FLAT.clear()
-                r, _ = L.build(pages, out_pdf)
-                print('4 review: %d pair(s) merged by the reviewer -> %d page(s)' % (len(merges), r['pages']), flush=True)
-            keep = os.path.join(out_dir, name + '.work')
-            shutil.rmtree(keep, ignore_errors=True)
-            shutil.copytree(pages, keep)
+                rebuild = True
+                print('4 review: %d pair(s) merged by the reviewer' % len(merges), flush=True)
             for q in queue:   # the queue points at the kept copies of the page images
                 for k in ('left_img', 'right_img'):
                     q[k] = os.path.join(keep, os.path.basename(q[k]))
             json.dump(queue, open(os.path.join(out_dir, name + '.queue.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+        gap_reqs += ai_hook.gaps(queue, [os.path.join(pages, os.path.basename(f)) for f in files]) or []
+        if gap_reqs:
+            done, pending = _repair_gaps(gap_reqs, pages, os.path.join(out_dir, name + '.gaps'))
+            rebuild = rebuild or done > 0
+            print('5 gap: %d repaired, %d task(s) waiting in %s' % (done, pending, name + '.gaps'), flush=True)
+        if rebuild:
+            os.remove(out_pdf)
+            L.UNCERTAIN.clear(); L.FLAT.clear()
+            r, _ = L.build(pages, out_pdf)
+            print('   rebuilt: %d page(s)' % r['pages'], flush=True)
         L.UNCERTAIN.clear(); L.FLAT.clear()
         print('OK', name, '->', out_pdf, flush=True)
     except Exception as e:
@@ -183,7 +229,11 @@ def main():
     ap.add_argument('--out', help='output folder (default: <first input dir>/arranged)')
     ap.add_argument('--seam', choices=('fast', 'full'), default='fast')
     ap.add_argument('--no-trim', action='store_true', help='do not trim white borders')
+    ap.add_argument('--no-overlap', action='store_true', help='do not look for overlapping pages')
+    ap.add_argument('--gaps', help='JSON file listing pairs with a missing band between them (see gap_repair.py)')
+    ap.add_argument('--force', action='store_true', help='redo books whose output PDF already exists')
     a = ap.parse_args()
+    L.OVERLAP = not a.no_overlap
     for u in a.inputs:
         if u.lower().endswith('.zip'):
             sys.exit('zip files are not accepted, unpack them first: ' + u)
@@ -191,7 +241,7 @@ def main():
     out = a.out or os.path.join(os.path.dirname(first), 'arranged')
     os.makedirs(out, exist_ok=True)
     for u in a.inputs:
-        process(u, out, a.seam, not a.no_trim)
+        process(u, out, a.seam, not a.no_trim, a.gaps, a.force)
 
 
 if __name__ == '__main__':

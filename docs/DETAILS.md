@@ -38,11 +38,11 @@ into double-width pages in place (original -> Recycle Bin). Use it after LOOKING
 Right-to-left books: the sheet says `p31 | p30` -> pass `31-30` (the first number is the left page).
 Note: `verify_spreads` flags smooth, soft-lit true spreads too (it is deliberately strict); look at the flagged pages before using `--fix`.
 
-## F. Overlapping half pages (`overlap_stitch.py`)
+## F. Overlapping half pages in an existing PDF (`overlap_stitch.py`, uses `overlap.py`)
 Some scans cut one picture into two pages that SHARE a narrow band (one scanned book: ~3-5 % of the page width, pages 4-5, 6-7, ...). The one-column seam rule cannot see that.
 `overlap_stitch.py book.pdf [--dry] [--pages a-b] [--force n] [--out file]`: a strip of the left page's right edge is searched in the right page's left part (OpenCV template matching), then the whole shared band is compared in colour against vertically shifted controls
 (`diff <= 0.4 * ctrl`, `score >= 0.85`, `diff <= 15`). Both orders are tried (right-to-left books). The merge is lossless: both JPEGs stay, the page is the union width, each image is clipped at the middle of the overlap.
-Per-book tool, NOT part of the default pipelines (the dry-run on the other 9 inline/form books found no such pairs). Plain sea/sky/wall pairs cannot be judged by it: look at them.
+For an already finished PDF; `auto.py` does the same on page images by default (the dry-run on 9 other books found no such pairs). Plain sea/sky/wall pairs cannot be judged by it: look at them.
 
 ## Stages (roadmap)
 The merge logic is built in stages, each one validated and switched on on its own:
@@ -51,14 +51,18 @@ The merge logic is built in stages, each one validated and switched on on its ow
 3. **Flat-background screening** (not done): about 20 % of neighbouring pairs have a flat seam (gray column std < 6). They are never merged and never reviewed today.
    True spreads with a flat seam have no labels in the library (the old rule never merged them); positives can be made by cutting single wide scans in the middle
    (extracted for tuning, not analysed yet). Candidate signals: tiny absolute colour difference, colour / brightness continuity over a ~5 % strip. Output: merge, UNCERTAIN sheet, or separate.
-4. **Overlap removal** (`overlap_stitch.py`, per book, not part of the default pipelines): on the 272-row analysis pictures it finds only 13-16 of the 29 overlapping pairs of that book
-   (all 29 at 0.5 scale), so it needs a half-scale confirmation and a cheap pre-screen before it can join the pipeline.
-5. **AI gap repair** (idea only): a gap between two halves (old books) could be filled by inpainting. It invents pixels (faces!), so: opt-in per book, classical inpainting for narrow gaps first,
-   and any model download only after asking.
+4. **Overlap removal** (done, `overlap.py`, default on): the pages of a picture share a band of only 3-5 % of the page width. Prescreen on 450-column pictures
+   (template score >= 0.7, 8 template columns: all 29 true pairs of the test book pass, 33 % of ordinary neighbours do), strict test on 900-column pictures
+   (`decide`: score >= 0.85, band difference <= 0.4 x the vertically shifted control). 29/29 found, dx error median 0 / max 2 px, 0/54 false. At the 272-row analysis
+   scale only 16/29 are found because the band is 5-9 columns there, hence the separate pictures. About 0.15 s per neighbouring pair.
+5. **Gap repair** (interface done, `gap_repair.py`, `ai_hook.py`): which pair has a missing band, and how wide, comes from a human (`--gaps`) or from `ai_hook.gaps`.
+   A task = RGBA canvas (left | transparent band | right) + mask + json; filled by `<task>.filled.png`, `ai_hook.fill_gap(job)` or the OpenCV `classic_fill` (narrow gaps, tests only);
+   `compose` takes only the gap (feathered edge) from the filled picture so the scanned pixels stay untouched. Invented content (faces!): opt-in per pair, any model download only after asking.
 Pairs the stages cannot decide go to a human look at every stage.
 
-## auto.py (new entry point)
-`python auto.py <folder-or-pdf> ... [--out DIR] [--seam fast|full] [--no-trim]` starts from a folder of images or complete PDFs (not zips):
+## auto.py (entry point)
+`python auto.py <folder-or-pdf> ... [--out DIR] [--seam fast|full] [--no-trim] [--no-overlap] [--gaps FILE] [--force]` starts from a folder of images or complete PDFs (not zips):
 drop blank / ad / duplicate pages, trim white borders, bring pages of the main aspect to the largest size of the group, merge seams
 (`--seam fast` = reduced-scale pictures, `--seam full` = original 2-px rule on full-resolution pictures; CUDA version planned, not written),
-queue the plain-colour pairs, and hand the undecided pairs to `ai_hook.review()` (default: nothing). Never put API keys or account data in this repository.
+join overlapping pages, queue the plain-colour pairs, hand the undecided pairs to `ai_hook.review()`, repair the gaps named by `--gaps` / `ai_hook.gaps()` (default: nothing).
+Never put API keys or account data in this repository.

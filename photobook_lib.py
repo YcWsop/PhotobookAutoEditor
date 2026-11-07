@@ -8,6 +8,7 @@ import pikepdf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import seam_load
 import seam_full
+import overlap
 try:
     import cv2
     _QR = cv2.QRCodeDetector()
@@ -70,6 +71,8 @@ UNCERTAIN = []          # (info_a, info_b) pairs the rule could not decide; see 
 FLAT = []               # (info_a, info_b, stats) pairs whose seam is a plain colour and nearly equal on both sides: the seam rule
                         # cannot judge them (screening stage, nothing is merged from here automatically)
 FORCE = {}              # frozenset({name_a, name_b}) -> (left name, right name): merges decided from outside (human / AI review)
+OWN_TAG = '_own'         # a page file with this in its name (e.g. a gap-repaired spread) gets a page exactly its own size and is never paired
+OVERLAP = True          # arrange(): look for pages that share a narrow band (overlap.py) when the seam rule says no
 FLAT_SEAM = 6.0         # a flat pair is queued when the colour difference across the seam is below this
 
 
@@ -315,6 +318,7 @@ def build(folder, out_pdf):
     for i in infos:
         i['name'] = os.path.relpath(i['path'], folder)
         i['key'] = i['path']
+        i['own_page'] = OWN_TAG in os.path.basename(i['path'])
         i['xo'] = (lambda dst, p=i['path']: make_xobject(dst, p))
     rep = arrange(infos, out_pdf, PT)
     rep['folder'] = os.path.basename(folder)
@@ -391,7 +395,7 @@ def arrange(infos, out_pdf, pt):
     """infos: items with name/key/xo (+ w,h,g,small,dh,sha when analysable, or opaque=True with a 'page').
     Writes out_pdf and returns a report dict."""
     from collections import Counter
-    rep = dict(total=len(infos), blank=[], ad=[], dup=[], spreads=0, wide_dedup=0, wide_kept=0, odd_size=0,
+    rep = dict(total=len(infos), blank=[], ad=[], dup=[], spreads=0, overlaps=0, wide_dedup=0, wide_kept=0, odd_size=0,
                opaque=sum(1 for i in infos if i.get('opaque')))
     # --- drop blank / ad / exact duplicates (opaque pages are never touched)
     seen = {}
@@ -415,13 +419,17 @@ def arrange(infos, out_pdf, pt):
     else:
         pw, ph = Counter((i['w'], i['h']) for i in plain).most_common(1)[0][0]
     # --- spreads: greedy over consecutive kept images
-    items = []  # ['single', info] | ['spread', L, R] | ['opaque', info]
+    items = []  # ['single', info] | ['spread', L, R] | ['overlap', L, R, metrics] | ['opaque', info]
+    ov_cache = {}
     k = 0
     while k < len(keep):
         A = keep[k]
         if A.get('opaque'):
             items.append(['opaque', A]); k += 1; continue
-        if k + 2 < len(keep) and not keep[k + 1].get('opaque') and not keep[k + 2].get('opaque'):
+        if A.get('own_page'):
+            items.append(['single', A]); k += 1; continue
+        solo = lambda i: i.get('opaque') or i.get('own_page')
+        if k + 2 < len(keep) and not solo(keep[k + 1]) and not solo(keep[k + 2]):
             # order  half, FULL, half : the full-width scan sits BETWEEN its two halves (the usual order is half, half, full)
             W, B = keep[k + 1], keep[k + 2]
             if ((A['w'], A['h']) == (B['w'], B['h']) and A['h'] > A['w'] and W['w'] > W['h'] * 1.15 and ph > pw):
@@ -436,15 +444,22 @@ def arrange(infos, out_pdf, pt):
                     rep['wide_dedup'] += 1
                     k += 3
                     continue
-        if k + 1 < len(keep) and not keep[k + 1].get('opaque'):
+        if k + 1 < len(keep) and not solo(keep[k + 1]):
+            nu, nf = len(UNCERTAIN), len(FLAT)
             so = spread_order(A, keep[k + 1])
             if so:
                 items.append(['spread', so[0], so[1]]); k += 2; continue
+            if OVERLAP:
+                ov = overlap.find(A, keep[k + 1], ov_cache)
+                if ov:                       # two partial pages sharing a band: not a seam case, so take it out of the review queues
+                    del UNCERTAIN[nu:], FLAT[nf:]
+                    Lh, Rh = (A, keep[k + 1]) if ov[0] == 'ltr' else (keep[k + 1], A)
+                    items.append(['overlap', Lh, Rh, ov[1]]); k += 2; continue
         items.append(['single', A]); k += 1
     # --- wide (full-width) duplicates of a detected spread
     final = []
     pairs = [it for it in items if it[0] == 'spread']
-    wides = [it for it in items if it[0] == 'single' and it[1]['w'] > it[1]['h'] * 1.15 and ph > pw]
+    wides = [it for it in items if it[0] == 'single' and not it[1].get('own_page') and it[1]['w'] > it[1]['h'] * 1.15 and ph > pw]
     removed_wide = set()
     for wd in wides:
         W = wd[1]
@@ -461,6 +476,7 @@ def arrange(infos, out_pdf, pt):
             continue
         final.append(it)
     rep['spreads'] = sum(1 for it in final if it[0] in ('spread',))
+    rep['overlaps'] = sum(1 for it in final if it[0] == 'overlap')
     rep['wide_kept'] = sum(1 for it in final if it[0] == 'wide_from_pair')
     # --- write pdf
     pdf = pikepdf.new()
@@ -479,11 +495,13 @@ def arrange(infos, out_pdf, pt):
             continue
         if kind == 'single':
             I = it[1]
-            if I['w'] > I['h'] * 1.15 and ph > pw:   # lone wide scan = a spread
+            if I.get('own_page'):                    # e.g. a gap-repaired spread: the page is the picture, scaled to the page height
+                bw, bh = PH * I['w'] / I['h'], PH
+            elif I['w'] > I['h'] * 1.15 and ph > pw:   # lone wide scan = a spread
                 bw, bh = PW * 2, PH
             else:
                 bw, bh = PW, PH
-            if (I['w'], I['h']) != (pw, ph) and bw == PW:
+            if (I['w'], I['h']) != (pw, ph) and bw == PW and not I.get('own_page'):
                 rep['odd_size'] += 1
             x, y, w, h = fit(I['w'], I['h'], bw, bh)
             ops = [(xo(I), x, y, w, h)]
@@ -494,6 +512,23 @@ def arrange(infos, out_pdf, pt):
             xr, yr, wr, hr = fit(R['w'], R['h'], PW, PH)
             ops = [(xo(L), xl, yl, wl, hl), (xo(R), PW + xr, yr, wr, hr)]
             page_w, page_h = PW * 2, PH
+        elif kind == 'overlap':
+            L, R, m = it[1], it[2], it[3]
+            g = overlap.geometry(m, L['w'], L['h'], R['h'])      # pixels of the left image
+            f = pt
+            dx, xs, top, Hi, dy = g['dx'], g['xs'], g['top'], g['Hi'], g['dy']
+            total_w = (dx + R['w']) * f
+            H = Hi * f
+            yl = (Hi + top - L['h']) * f                         # PDF y grows upward
+            yr = (Hi - dy + top - R['h']) * f
+            xd = pikepdf.Dictionary(Im0=xo(L), Im1=xo(R))
+            cs_ = ('q 0 0 %.4f %.4f re W n %.4f 0 0 %.4f 0 %.4f cm /Im0 Do Q '
+                   'q %.4f 0 %.4f %.4f re W n %.4f 0 0 %.4f %.4f %.4f cm /Im1 Do Q') % (
+                xs * f, H, L['w'] * f, L['h'] * f, yl, xs * f, total_w - xs * f, H, R['w'] * f, R['h'] * f, dx * f, yr)
+            page = pikepdf.Dictionary(Type=pikepdf.Name.Page, MediaBox=[0, 0, round(total_w, 2), round(H, 2)],
+                                      Resources=pikepdf.Dictionary(XObject=xd), Contents=pikepdf.Stream(pdf, cs_.encode()))
+            pdf.pages.append(pikepdf.Page(page))
+            continue
         else:  # wide_from_pair
             I = it[3]
             x, y, w, h = fit(I['w'], I['h'], PW * 2, PH)

@@ -27,7 +27,7 @@ big = photo(5, 2 * W, H)
 left, right = big.crop((0, 0, W, H)), big.crop((W, 0, 2 * W, H))
 big2 = photo(9, 2 * W, H)
 l2, r2 = big2.crop((0, 0, W, H)), big2.crop((W, 0, 2 * W, H))
-ad = Image.open(r'D:\pdfarranger\photobook_tools\ads\gravidia_survey.jpg').convert('RGB').resize((W, H))
+ad = Image.open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ads', 'gravidia_survey.jpg')).convert('RGB').resize((W, H))
 pages = [photo(1), left, right, Image.new('RGB', (W, H), 'white'), photo(2), ad, photo(3), r2, l2, photo(4)]
 # note p8|p9 are given right-then-left (right-to-left book): must still be merged in the right order
 folder = os.path.join(work, 'folder')
@@ -102,4 +102,43 @@ for n, im in enumerate([on_wall(1), on_wall(2), on_wall(3), on_wall(4)], 1):
     jpg(im, os.path.join(f4, 'page_%02d.jpg' % n))
 rep4, _ = L.build(f4, os.path.join(work, 'f4.pdf'))
 assert rep4['spreads'] == 0 and rep4['pages'] == 4, rep4
+# --- overlap: one picture scanned as two pages that SHARE a 5 % band (the seam rule cannot see this: the band is duplicated, not continued)
+ov = int(W * 0.05)
+big5 = photo(40, 2 * W - ov, H)
+o_l, o_r = big5.crop((0, 0, W, H)), big5.crop((W - ov, 0, 2 * W - ov, H))
+f5 = os.path.join(work, 'folder5'); os.makedirs(f5)
+for n, im in enumerate([photo(50), o_l, o_r, photo(51), photo(52)], 1):
+    jpg(im, os.path.join(f5, 'page_%02d.jpg' % n))
+rep5, _ = L.build(f5, os.path.join(work, 'f5.pdf'))
+assert rep5['overlaps'] == 1 and rep5['pages'] == 4 and rep5['spreads'] == 0, rep5
+with pikepdf.open(os.path.join(work, 'f5.pdf')) as pdf5:
+    mb = [float(v) for v in pdf5.pages[1].MediaBox]
+assert abs(mb[2] / mb[3] - (2 * W - ov) / H) < 0.01, mb      # page = the union of the two scans
+L.OVERLAP = False
+rep5b, _ = L.build(f5, os.path.join(work, 'f5b.pdf'))
+assert rep5b['overlaps'] == 0 and rep5b['pages'] == 5, rep5b
+L.OVERLAP = True
+print('OVERLAP ok')
+
+# --- gap repair: transparent band between two pages, filled picture composed back, the pages' own pixels untouched
+import gap_repair
+gj = gap_repair.make_job(os.path.join(f5, 'page_02.jpg'), os.path.join(f5, 'page_03.jpg'), 0.04, os.path.join(work, 'gaps'))
+cv = np.asarray(Image.open(gj['canvas']))
+x0, _, x1, _ = gj['gap_box']
+assert cv.shape[2] == 4 and (cv[:, x0:x1, 3] == 0).all() and (cv[:, :x0, 3] == 255).all() and (cv[:, x1:, 3] == 255).all()
+filled = gap_repair.classic_fill(gj)
+final = gap_repair.compose(gj, filled, os.path.join(work, 'gap_final.jpg'))
+fin = np.asarray(Image.open(final).convert('RGB')).astype(int)
+assert fin.shape[:2] == cv.shape[:2]
+far = np.r_[0:x0 - 10, x1 + 10:cv.shape[1]]
+assert np.abs(fin[:, far] - cv[:, far, :3].astype(int)).mean() < 2.5, 'pixels outside the gap changed'     # only JPEG noise
+assert fin[:, x0:x1].std() > 0
+f6 = os.path.join(work, 'folder6'); os.makedirs(f6)
+shutil.copy(os.path.join(f5, 'page_01.jpg'), os.path.join(f6, 'a_01.jpg')); shutil.copy(final, os.path.join(f6, 'a_02_own.jpg'))
+shutil.copy(os.path.join(f5, 'page_04.jpg'), os.path.join(f6, 'a_03.jpg'))
+rep6, _ = L.build(f6, os.path.join(work, 'f6.pdf'))
+with pikepdf.open(os.path.join(work, 'f6.pdf')) as pdf6:
+    mb = [float(v) for v in pdf6.pages[1].MediaBox]
+assert rep6['pages'] == 3 and abs(mb[2] / mb[3] - fin.shape[1] / fin.shape[0]) < 0.01, (rep6, mb)
+print('GAP ok')
 print('ALL OK')

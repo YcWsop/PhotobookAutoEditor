@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import photobook_lib as L
+from overlap import match_pair, decide, geometry, _gray
 
 
 def one_image(pg):
@@ -33,66 +34,6 @@ def load_small(x, scale=0.5):
     w, h = im.size
     sm = im.resize((max(8, int(w * scale)), max(8, int(h * scale))), Image.BILINEAR)
     return np.asarray(sm)
-
-
-def _gray(a):
-    return cv2.cvtColor(a, cv2.COLOR_RGB2GRAY).astype(np.float32)
-
-
-def match_pair(A, B, k_frac=0.03, ov_max=0.40, dy_frac=0.05):
-    """A = left page, B = right page (RGB arrays, same width, heights may differ a little).
-    The two pages share a narrow band: A's rightmost columns reappear at B's left edge.  A strip of A's right edge (the 'paragraph')
-    is searched in B's left part, then the WHOLE shared band is verified in colour against vertically shifted controls.
-    dx = column of A that coincides with B's column 0; dy = A row of B's row 0 (A row = B row + dy); ovl = shared width / page width."""
-    ha, w = A.shape[:2]
-    hb = B.shape[0]
-    if B.shape[1] != w or min(ha, hb) < 80 or w < 60:
-        return None
-    ga, gb = _gray(A), _gray(B)
-    k = max(10, int(w * k_frac))
-    dy_max = max(int(min(ha, hb) * dy_frac), abs(ha - hb) + 6)
-    y0, y1 = int(ha * 0.12), int(ha * 0.88)
-    tmpl = ga[y0:y1, w - k:w]
-    if tmpl.std() < 5:                      # flat strip (plain wall/sky): nothing to lock on
-        return None
-    rb0, rb1 = max(0, y0 - dy_max), min(hb, y1 + dy_max)
-    xmax = int(w * ov_max)
-    reg = gb[rb0:rb1, 0:xmax]
-    if reg.shape[0] < tmpl.shape[0] or reg.shape[1] < tmpl.shape[1]:
-        return None
-    res = cv2.matchTemplate(reg, tmpl, cv2.TM_CCOEFF_NORMED)
-    _, score, _, loc = cv2.minMaxLoc(res)
-    r2 = res.copy()
-    cv2.circle(r2, loc, max(4, k), -1, -1)
-    second = float(r2.max())
-    ovl_px = loc[0] + k                      # B column (ovl_px-1) is A's last column
-    dx = w - ovl_px
-    dy = y0 - (rb0 + loc[1])
-
-    def band_diff(ddy, extra=0):
-        wd = ovl_px + extra
-        if wd < 6 or wd > w:
-            return 1e9
-        xa = w - wd
-        ya0, ya1 = max(0, dy + ddy), min(ha, hb + dy + ddy)
-        if ya1 - ya0 < min(ha, hb) * 0.6:
-            return 1e9
-        yb0, yb1 = ya0 - dy - ddy, ya1 - dy - ddy
-        a = A[ya0:ya1, xa:w].astype(np.float32)
-        b = B[yb0:yb1, 0:wd].astype(np.float32)
-        return float(np.abs(a - b).mean())
-    diff = band_diff(0)
-    off = dy_max + 8
-    ctrl = float(np.median([band_diff(-off), band_diff(off), band_diff(-2 * off), band_diff(2 * off)]))
-    return dict(score=float(score), second=second, ovl=ovl_px / w, dx=int(dx), dy=int(dy), diff=diff, ctrl=ctrl, w=w, ha=ha, hb=hb)
-
-
-def decide(m):
-    """True if the pair is one picture cut into two overlapping pages.
-    A true pair: the shared band matches almost perfectly (diff far below the vertically shifted controls); two different photos never do."""
-    if m is None:
-        return False
-    return (m['score'] >= 0.85 and m['diff'] <= 0.4 * m['ctrl'] and m['diff'] <= 15 and 0.02 <= m['ovl'] <= 0.40)
 
 
 def analyse(pdf, lo, hi):
@@ -117,14 +58,6 @@ def analyse(pdf, lo, hi):
                 best, order = m, o
         out.append((i, order, best, m1, m2))
     return out
-
-
-def geometry(m, wl, hl, hr):
-    """Page geometry in image pixels of the LEFT image: seam x, union-intersection rows. -> dict"""
-    dx, dy = m['dx'] * (wl / m['w']), m['dy'] * (wl / m['w'])
-    top_i = max(0.0, dy)
-    bot_i = min(hl, hr + dy)
-    return dict(dx=dx, dy=dy, xs=dx + (wl - dx) / 2.0, top=top_i, Hi=bot_i - top_i)
 
 
 def stitch_preview(pdf, i, order, m, H=330):
