@@ -157,4 +157,11 @@ with pikepdf.open(os.path.join(work, 'f6.pdf')) as pdf6:
     mb = [float(v) for v in pdf6.pages[1].MediaBox]
 assert rep6['pages'] == 3 and abs(mb[2] / mb[3] - fin.shape[1] / fin.shape[0]) < 0.01, (rep6, mb)
 print('GAP ok')
+
+# --- page decoding runs on a fixed pool of 4 threads and the pages keep their order
+import seam_load
+assert seam_load.THREADS == 4
+order = [os.path.basename(i['path']) for i in L.build(f5, os.path.join(work, 'f5_order.pdf'))[1]]
+assert order == sorted(order, key=L.natkey), order
+print('THREADS ok')
 print('ALL OK')
