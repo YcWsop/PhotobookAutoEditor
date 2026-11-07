@@ -8,7 +8,8 @@
               --seam fast = 缩小尺寸的图（默认），--seam full = 完整图 + 原来的 2 像素规则（慢；CUDA 版计划中，未写）
   3 flat      接缝是纯色的页对不自动合并；颜色几乎相同的进队列
   4 review    规则判不了的页对（uncertain + flat）交给 ai_hook.review()，返回的页对被合并，其余留在联系表里
-  5 gap       中间缺了一条的两页：做成带透明缝的大图 + 蒙版（gap_repair.py），交给 ai_hook.fill_gap() 或读取已补好的 .filled.png；
+  5 gap       中间缺了一条的两页（--gaps 文件点名，或 ai_hook.gaps() 返回页对，不报缝宽）：做成任务单（左右两张原图，gap_repair.py），
+              交给 ai_hook.fill_gap() 补出中间那一条（宽度由模型定），或读取已补好的 .filled.png；
               没人补的任务单留在 <书名>.gaps/，书保持两页
 输出: <out>/<书名>.pdf，联系表 <书名>.uncertain.jpg / .flat.jpg，队列 <书名>.queue.json（+ <书名>.work/ 页面图），补缝任务 <书名>.gaps/
 """
@@ -124,17 +125,24 @@ def prepare(paths, work, trim=True):
 
 
 def _read_gaps(path):
-    """--gaps file: JSON list of {"left": "p0007.jpg", "right": "p0008.jpg", "gap": 0.04} or [left, right, gap]"""
+    """--gaps file: JSON list of {"left": "p0007.jpg", "right": "p0008.jpg"} or [left, right]. Only WHICH pages: no width, the model
+    that fills the gap decides it."""
+    return _gap_pairs(json.load(open(path, encoding='utf-8')))
+
+
+def _gap_pairs(result):
+    """list of dicts / [left, right] lists (a --gaps file or the result of ai_hook.gaps()) -> [{'left', 'right'}]. Anything else in an entry,
+    a width included, is dropped: the width cannot be estimated reliably and is not an input."""
     out = []
-    for g in json.load(open(path, encoding='utf-8')):
-        if isinstance(g, (list, tuple)):
-            g = dict(left=g[0], right=g[1], gap=g[2] if len(g) > 2 else 0.04)
-        out.append(g)
+    for g in result or []:
+        l, r = (g['left'], g['right']) if isinstance(g, dict) else (g[0], g[1])
+        out.append(dict(left=l, right=r))
     return out
 
 
 def _repair_gaps(reqs, pages, gaps_dir):
-    """write a task (transparent-gap picture + mask) for each request; use <task>.filled.png or ai_hook.fill_gap() when there is one.
+    """write a task (the two original pages) for each request; the strip between them comes from <task>.filled.png or ai_hook.fill_gap()
+    (the model decides its width).
     A repaired pair becomes ONE page file '<left stem>_own.jpg' in `pages`. -> (repaired, still waiting)"""
     done = pending = 0
     for g in reqs:
@@ -142,7 +150,7 @@ def _repair_gaps(reqs, pages, gaps_dir):
         if not (os.path.exists(lp) and os.path.exists(rp)):
             print('   gap: page not found, skipped:', g['left'], g['right'], flush=True)
             continue
-        job = gap_repair.make_job(lp, rp, float(g.get('gap', 0.04)), gaps_dir)
+        job = gap_repair.make_job(lp, rp, gaps_dir)
         filled = job['filled'] if os.path.exists(job['filled']) else ai_hook.fill_gap(job)
         if not filled or not os.path.exists(filled):
             pending += 1
@@ -204,7 +212,7 @@ def process(unit, out_dir, seam, trim, gap_file=None, force=False):
                 for k in ('left_img', 'right_img'):
                     q[k] = os.path.join(keep, os.path.basename(q[k]))
             json.dump(queue, open(os.path.join(out_dir, name + '.queue.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
-        gap_reqs += ai_hook.gaps(queue, [os.path.join(pages, os.path.basename(f)) for f in files]) or []
+        gap_reqs += _gap_pairs(ai_hook.gaps(queue, [os.path.join(pages, os.path.basename(f)) for f in files]))
         if gap_reqs:
             done, pending = _repair_gaps(gap_reqs, pages, os.path.join(out_dir, name + '.gaps'))
             rebuild = rebuild or done > 0

@@ -59,14 +59,19 @@ The merge logic is built in stages, each one validated and switched on on its ow
    (template score >= 0.7, 8 template columns: all 29 true pairs of the test book pass, 33 % of ordinary neighbours do), strict test on 900-column pictures
    (`decide`: score >= 0.85, band difference <= 0.4 x the vertically shifted control). 29/29 found, dx error median 0 / max 2 px, 0/54 false. At the 272-row analysis
    scale only 16/29 are found because the band is 5-9 columns there, hence the separate pictures. About 0.15 s per neighbouring pair.
-5. **Gap repair** (interface done, `gap_repair.py`, `ai_hook.py`): which pair has a missing band, and how wide, comes from a human (`--gaps`) or from `ai_hook.gaps`.
-   A task = RGBA canvas (left | transparent band | right) + mask + json; filled by `<task>.filled.png`, `ai_hook.fill_gap(job)` or the OpenCV `classic_fill` (narrow gaps, tests only);
-   `compose` takes only the gap (feathered edge) from the filled picture so the scanned pixels stay untouched. Invented content (faces!): opt-in per pair, any model download only after asking.
+5. **Gap repair** (interface done, `gap_repair.py`, `ai_hook.py`): WHICH pair has a missing band comes from a human (`--gaps`) or from `ai_hook.gaps` (pairs only; any width it returns is dropped).
+   Nobody estimates or fixes the width: a task is a json with the two ORIGINAL pages (copied next to the job: `left_img`, `right_img`) and a prompt; the model draws the missing middle strip itself, width included.
+   The strip comes from `<task>.filled.png`, `ai_hook.fill_gap(job)` or the OpenCV `classic_fill` (narrow strip, tests only, width is a test parameter).
+   `compose` builds left page | strip | right page: the strip is scaled to the page height (its own aspect ratio sets the width) and gets a smooth per-row colour correction so its edges meet the pages' edge columns;
+   the scanned pixels stay untouched. Invented content (faces!): opt-in per pair, any model download only after asking.
+   Why no width estimate (2026-11, 60 real wide pages from two books cut with synthetic 2/4/8 % gaps): pairs of straight lines through the seam recover the width exactly but only ~2 % of the pages have one;
+   row-wise brightness extrapolation (median error 63-84 %) and local-edge voting (77 %, confidence uninformative) are no better than always guessing 4 % (50 %);
+   a multimodal model reading the picture (8 blind trials, median error 53 % vs 61 % for the constant) is not either. Not tested: how plausible the widths are that an image model chooses when it draws the strip.
 Pairs the stages cannot decide go to a human look at every stage.
 
 ## auto.py (entry point)
 `python auto.py <folder-or-pdf> ... [--out DIR] [--seam fast|full] [--no-trim] [--no-overlap] [--gaps FILE] [--force]` starts from a folder of images or complete PDFs (not zips):
 drop blank / ad / duplicate pages, trim white borders, bring pages of the main aspect to the largest size of the group, merge seams
 (`--seam fast` = reduced-scale pictures, `--seam full` = original 2-px rule on full-resolution pictures; CUDA version planned, not written),
-join overlapping pages, queue the plain-colour pairs, hand the undecided pairs to `ai_hook.review()`, repair the gaps named by `--gaps` / `ai_hook.gaps()` (default: nothing).
+join overlapping pages, queue the plain-colour pairs, hand the undecided pairs to `ai_hook.review()`, repair the gaps named by `--gaps` / `ai_hook.gaps()` (default: nothing; the model that draws the strip decides its width).
 Never put API keys or account data in this repository.

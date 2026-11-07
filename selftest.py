@@ -120,19 +120,35 @@ assert rep5b['overlaps'] == 0 and rep5b['pages'] == 5, rep5b
 L.OVERLAP = True
 print('OVERLAP ok')
 
-# --- gap repair: transparent band between two pages, filled picture composed back, the pages' own pixels untouched
+# --- gap repair: the job holds the two ORIGINAL pages (no width anywhere); the model's strip can have any size and the pages' own pixels stay untouched
 import gap_repair
-gj = gap_repair.make_job(os.path.join(f5, 'page_02.jpg'), os.path.join(f5, 'page_03.jpg'), 0.04, os.path.join(work, 'gaps'))
-cv = np.asarray(Image.open(gj['canvas']))
-x0, _, x1, _ = gj['gap_box']
-assert cv.shape[2] == 4 and (cv[:, x0:x1, 3] == 0).all() and (cv[:, :x0, 3] == 255).all() and (cv[:, x1:, 3] == 255).all()
-filled = gap_repair.classic_fill(gj)
-final = gap_repair.compose(gj, filled, os.path.join(work, 'gap_final.jpg'))
+pl, pr = os.path.join(f5, 'page_02.jpg'), os.path.join(f5, 'page_03.jpg')
+gj = gap_repair.make_job(pl, pr, os.path.join(work, 'gaps'))
+assert os.path.exists(gj['left_img']) and os.path.exists(gj['right_img']) and gj['left_img'] != pl, gj    # own copies next to the job
+assert not any(k in gj for k in ('canvas', 'mask', 'gap_box', 'gap_px', 'gap_frac')), gj                  # no width in the job
+left_a = np.asarray(Image.open(gj['left_img']).convert('RGB')).astype(int)
+right_a = np.asarray(Image.open(gj['right_img']).convert('RGB')).astype(int)
+H = left_a.shape[0]
+strip_path = gap_repair.classic_fill(gj, 0.04)                       # test-only filler: a narrow strip
+sw0 = np.asarray(Image.open(strip_path)).shape
+assert sw0[0] == H and sw0[1] == max(2, round(0.04 * left_a.shape[1])), sw0
+# a "model" strip at another resolution (half height, any width): compose scales it to the page height, its aspect ratio sets the gap width
+odd = os.path.join(work, 'odd_strip.png')
+Image.open(strip_path).convert('RGB').resize((9, H // 2)).save(odd)
+final = gap_repair.compose(gj, odd, os.path.join(work, 'gap_final_odd.jpg'))
+assert np.asarray(Image.open(final)).shape[1] == left_a.shape[1] + max(2, round(9 * H / (H // 2))) + right_a.shape[1]
+final = gap_repair.compose(gj, strip_path, os.path.join(work, 'gap_final.jpg'))
 fin = np.asarray(Image.open(final).convert('RGB')).astype(int)
-assert fin.shape[:2] == cv.shape[:2]
-far = np.r_[0:x0 - 10, x1 + 10:cv.shape[1]]
-assert np.abs(fin[:, far] - cv[:, far, :3].astype(int)).mean() < 2.5, 'pixels outside the gap changed'     # only JPEG noise
+x0, x1 = left_a.shape[1], left_a.shape[1] + sw0[1]
+assert fin.shape == (H, x1 + right_a.shape[1], 3), fin.shape
+assert np.abs(fin[:, :x0] - left_a).mean() < 2.5 and np.abs(fin[:, x1:] - right_a).mean() < 2.5, 'page pixels changed'    # only JPEG noise
+assert np.abs(fin[:, x0] - left_a[:, -1]).mean() < 12 and np.abs(fin[:, x1 - 1] - right_a[:, 0]).mean() < 12, 'strip edges do not meet the pages'
 assert fin[:, x0:x1].std() > 0
+# the AI (or a --gaps file) only names pairs; any width in an entry is dropped
+import auto
+assert auto._gap_pairs(None) == [] and auto._gap_pairs([]) == []
+assert auto._gap_pairs([('a.jpg', 'b.jpg'), {'left': 'c.jpg', 'right': 'd.jpg', 'gap': 0.2}]) == [
+    dict(left='a.jpg', right='b.jpg'), dict(left='c.jpg', right='d.jpg')]
 f6 = os.path.join(work, 'folder6'); os.makedirs(f6)
 shutil.copy(os.path.join(f5, 'page_01.jpg'), os.path.join(f6, 'a_01.jpg')); shutil.copy(final, os.path.join(f6, 'a_02_own.jpg'))
 shutil.copy(os.path.join(f5, 'page_04.jpg'), os.path.join(f6, 'a_03.jpg'))
