@@ -48,9 +48,13 @@ For an already finished PDF; `auto.py` does the same on page images by default (
 The merge logic is built in stages, each one validated and switched on on its own:
 1. **Read** (done): every page is decoded once at reduced JPEG scale (`seam_load.py`).
 2. **Seam merge** (done): `seam_match`; pairs that almost pass go to a contact sheet for a human look (UNCERTAIN).
-3. **Flat-background screening** (not done): about 20 % of neighbouring pairs have a flat seam (gray column std < 6). They are never merged and never reviewed today.
-   True spreads with a flat seam have no labels in the library (the old rule never merged them); positives can be made by cutting single wide scans in the middle
-   (extracted for tuning, not analysed yet). Candidate signals: tiny absolute colour difference, colour / brightness continuity over a ~5 % strip. Output: merge, UNCERTAIN sheet, or separate.
+3. **Flat-background screening** (done as a queue filter, nothing is merged): 34 % of neighbouring pairs have a flat seam (gray column std < 6), 99 % of those are constant light colours.
+   Data: 65 flat-seam wide pages (the 2716 single wide scans of the library cut in the middle), looked at one by one: 33 are one picture, 32 are two different pages scanned side by side
+   (text pages, blank + photo, two photos) which serve as extra negatives; 2011 neighbouring pairs of the library as negatives (they contain a few unlabelled spreads, so false-positive counts are upper bounds).
+   One seam column carries almost no information: seam difference, offset, slopes and extrapolation do not separate (AUC 0.5-0.6). What helps: brightness (true flat spreads are mostly dark pictures, 8 of 12; the pairs are mostly white pages)
+   and, where the faint row profile has structure (pstd >= 0.5), its correlation across the seam (6/6 true >= 0.74; library 16 of 51 >= 0.7; but text pages also correlate: 9/9 layout >= 0.8).
+   `flat_keep`: constant light seam dropped; queue 688 -> 55 of 2011, 11/12 true kept. No tier is precise enough to merge automatically (best: pcorr >= 0.85, 4 true vs 7 layout vs 9 library).
+   The positives come from scans of open books (centre gutter line), so recall is only indicative.
 4. **Overlap removal** (done, `overlap.py`, default on): the pages of a picture share a band of only 3-5 % of the page width. Prescreen on 450-column pictures
    (template score >= 0.7, 8 template columns: all 29 true pairs of the test book pass, 33 % of ordinary neighbours do), strict test on 900-column pictures
    (`decide`: score >= 0.85, band difference <= 0.4 x the vertically shifted control). 29/29 found, dx error median 0 / max 2 px, 0/54 false. At the 272-row analysis

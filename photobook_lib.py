@@ -3,6 +3,7 @@ merge two-page spreads, dedupe full-width scans of spreads (keep the higher-reso
 uniform page size, and optional ad stripping from existing PDFs."""
 import sys, os, re, io, json, zlib, hashlib
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from PIL import Image
 import pikepdf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -73,6 +74,7 @@ FLAT = []               # (info_a, info_b, stats) pairs whose seam is a plain co
 FORCE = {}              # frozenset({name_a, name_b}) -> (left name, right name): merges decided from outside (human / AI review)
 OWN_TAG = '_own'         # a page file with this in its name (e.g. a gap-repaired spread) gets a page exactly its own size and is never paired
 OVERLAP = True          # arrange(): look for pages that share a narrow band (overlap.py) when the seam rule says no
+FLAT_PSTD, FLAT_WHITE, FLAT_PCORR = 0.5, 235, 0.5   # flat_keep(): constant seam below pstd is queued only if not light; structured seam needs this row-profile correlation
 FLAT_SEAM = 6.0         # a flat pair is queued when the colour difference across the seam is below this
 
 
@@ -130,6 +132,29 @@ def seam_match(A, B, ratio_thr=SEAM_RATIO, jump_thr=SEAM_JUMP, smooth_ok=False):
     return ok, st['ratio']
 
 
+def flat_stats(A, B):
+    """extra numbers for a pair with a plain-colour seam (edge columns of the 272-row pictures)
+      pstd    structure left in the seam columns: std of the 9-row-smoothed gray row profile (0 = one constant colour)
+      pcorr   correlation of the two smoothed row profiles (horizon / floor lines that continue score high)
+      bright  mean gray level of the two seam columns"""
+    gw = np.array([0.299, 0.587, 0.114], np.float32)
+    a, b = A['rgb8'][:, -1].astype(np.float32) @ gw, B['rgb8'][:, 0].astype(np.float32) @ gw
+    pa, pb = uniform_filter1d(a, 9), uniform_filter1d(b, 9)
+    pa, pb = pa - pa.mean(), pb - pb.mean()
+    return dict(pstd=float(min(pa.std(), pb.std())), pcorr=float((pa * pb).mean() / (pa.std() * pb.std() + 1e-3)),
+                bright=float((a.mean() + b.mean()) / 2))
+
+
+def flat_keep(fs):
+    """Screening of flat-seam pairs that are queued for a look (nothing is ever merged from here).
+    A seam of ONE constant light colour (white margins / white backdrop) carries no evidence at all: 99.8 % of such pairs are separate
+    pages, so they are not queued. Queued: constant dark / coloured seams, and seams whose faint row structure matches on both sides.
+    Test on the library: queue 688 -> 55 of 2011 flat neighbour pairs, 11 of 12 true flat spreads kept (see docs/DETAILS.md)."""
+    if fs['pstd'] < FLAT_PSTD:
+        return fs['bright'] <= FLAT_WHITE
+    return fs['pcorr'] >= FLAT_PCORR
+
+
 def spread_order(A, B):
     if A.get('opaque') or B.get('opaque'):
         return None
@@ -153,7 +178,9 @@ def spread_order(A, B):
             sts = [(seam_stats(X, Y), X, Y) for X, Y in ((A, B), (B, A))]
             st, X, Y = min(sts, key=lambda s: s[0]['seam'])
             if st['std'] < SEAM_STD and st['seam'] < FLAT_SEAM:
-                FLAT.append((X, Y, st))
+                fs = flat_stats(X, Y)
+                if flat_keep(fs):
+                    FLAT.append((X, Y, dict(st, **fs)))
     return None
 
 
